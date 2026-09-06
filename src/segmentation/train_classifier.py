@@ -33,7 +33,7 @@ def load_all_samples(nusc, sample_tokens):
         lidar_data = nusc.get('sample_data', lidar_token)
         pc_path = os.path.join(DATAROOT, lidar_data['filename'])
         pc = LidarPointCloud.from_file(pc_path)
-        pts = pc.points.T[:, :4]  # x,y,z,intensity
+        pts = pc.points.T[:, :4]
         lidarseg_path = os.path.join(DATAROOT, "lidarseg", "v1.0-mini", lidar_token + "_lidarseg.bin")
         raw = np.fromfile(lidarseg_path, dtype=np.uint8)
         bucket = np.vectorize(REMAP.get)(raw)
@@ -44,7 +44,6 @@ def load_all_samples(nusc, sample_tokens):
 
 nusc = NuScenes(version='v1.0-mini', dataroot=DATAROOT, verbose=False)
 
-# Split scenes: first 8 for training, last 2 held out for validation
 train_tokens, val_tokens = [], []
 for i, scene in enumerate(nusc.scene):
     tok = scene['first_sample_token']
@@ -61,7 +60,13 @@ X_val, y_val = load_all_samples(nusc, val_tokens)
 
 print(f"Train points: {X_train.shape[0]:,}, Val points: {X_val.shape[0]:,}")
 
-# Normalize features
+# --- Compute class weights: inverse frequency, so rare "dynamic" class gets more weight ---
+class_counts = np.bincount(y_train, minlength=3)
+print("Train class counts:", class_counts)
+class_weights = class_counts.sum() / (3 * class_counts)
+class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+print("Class weights (terrain, static, dynamic):", class_weights.cpu().numpy())
+
 mean, std = X_train.mean(0), X_train.std(0)
 X_train = (X_train - mean) / std
 X_val = (X_val - mean) / std
@@ -73,13 +78,13 @@ y_val_t = torch.tensor(y_val, dtype=torch.long).to(device)
 
 model = PointClassifier().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-criterion = nn.CrossEntropyLoss()
+criterion = nn.CrossEntropyLoss(weight=class_weights)  # <-- key change
 
 batch_size = 8192
-n_epochs = 15
+n_epochs = 20
 n_train = X_train_t.shape[0]
 
-print("Training...")
+print("Training with class-weighted loss...")
 for epoch in range(n_epochs):
     model.train()
     perm = torch.randperm(n_train)
@@ -98,6 +103,13 @@ for epoch in range(n_epochs):
         with torch.no_grad():
             val_pred = model(X_val_t).argmax(1)
             val_acc = (val_pred == y_val_t).float().mean().item()
+            for cls, name in [(0,"Terrain"), (1,"Static"), (2,"Dynamic")]:
+                true_mask = (y_val_t == cls)
+                pred_mask = (val_pred == cls)
+                tp = ((true_mask) & (pred_mask)).sum().item()
+                prec = tp / max(pred_mask.sum().item(), 1)
+                rec = tp / max(true_mask.sum().item(), 1)
+                print(f"  {name}: precision={prec:.2f}, recall={rec:.2f}")
         print(f"Epoch {epoch+1}/{n_epochs} - loss: {total_loss:.2f} - val_acc: {val_acc:.3f}")
 
 torch.save({"model": model.state_dict(), "mean": mean, "std": std}, "src/segmentation/point_classifier.pt")
